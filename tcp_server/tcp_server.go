@@ -147,7 +147,7 @@ func (server *TCPServer) handleConn(conn net.Conn) {
 	go server.writeConn(conn, ci.writeChannel, server.conf.WriteRetryCount, server.conf.WriteRetryPeriodSec)
 
 	if server.callbacks != nil {
-		go server.callbacks.OnConnect(server, conn)
+		server.callbacks.OnConnect(server, conn)
 	}
 
 	for {
@@ -179,7 +179,7 @@ func (server *TCPServer) readConn(conn net.Conn, retryCount uint, retryPeriodSec
 		}
 
 		if server.callbacks != nil {
-			go server.callbacks.OnReceive(server, conn, data, n)
+			server.callbacks.OnReceive(server, conn, data, n)
 		}
 	}
 }
@@ -205,7 +205,7 @@ func (server *TCPServer) writeConn(conn net.Conn, writeChan <-chan []byte, retry
 		}
 
 		if server.callbacks != nil {
-			go server.callbacks.OnWrite(server, conn, n)
+			server.callbacks.OnWrite(server, conn, n)
 		}
 	}
 }
