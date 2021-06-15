@@ -4,10 +4,14 @@ import (
 	"net"
 	"sync"
 	"tcp-server/utils"
+	"time"
 )
 
 const (
-	defaultReceiveBufferSize = 4 * 1024
+	defaultReceiveBufferSize     = 4 * 1024
+	defaultWriteRetryPeriodSec   = 10
+	defaultReceiveRetryPeriodSec = 10
+	writeChannelBuffer           = 1 * 1024
 )
 
 // TCPServerCallbacks TCPServer回调
@@ -43,26 +47,39 @@ type TCPServerCallbacks interface {
 	OnWriteError(server *TCPServer, conn net.Conn, err error)
 }
 
+type tcpServerConfig struct {
+	ReceiveBufferSize     uint
+	WriteRetryCount       uint
+	WriteRetryPeriodSec   uint
+	ReceiveRetryCount     uint
+	ReceiveRetryPeriodSec uint
+}
+
+func NewTCPServerConfig() *tcpServerConfig {
+	return &tcpServerConfig{
+		ReceiveBufferSize:     defaultReceiveBufferSize,
+		WriteRetryCount:       0,
+		WriteRetryPeriodSec:   defaultWriteRetryPeriodSec,
+		ReceiveRetryCount:     0,
+		ReceiveRetryPeriodSec: defaultReceiveRetryPeriodSec,
+	}
+}
+
 // TCPServer TCPServer结构
 type TCPServer struct {
-	receiveBufferSize uint
+	conf *tcpServerConfig
 
 	listener net.Listener
 
-	clientChannelMap      map[net.Conn]*clientChannel
-	clientChannelMapMutex sync.RWMutex
+	clientInstanceMap      map[net.Conn]*clientInstance
+	clientInstanceMapMutex sync.RWMutex
 
 	callbacks TCPServerCallbacks
 }
 
-type clientChannel struct {
-	writeChannel chan []byte
-	stopChannel  chan interface{}
-}
-
 // NewTCPServer 创建并启动TCPServer
-func NewTCPServer(address string, receiveBufferSize uint, callbacks TCPServerCallbacks) (*TCPServer, error) {
-	if utils.IsStringEmpty(address) {
+func NewTCPServer(conf *tcpServerConfig, address string, callbacks TCPServerCallbacks) (*TCPServer, error) {
+	if conf == nil || utils.IsStringEmpty(address) {
 		return nil, ErrParam
 	}
 
@@ -72,13 +89,8 @@ func NewTCPServer(address string, receiveBufferSize uint, callbacks TCPServerCal
 	}
 
 	server := new(TCPServer)
-
-	if receiveBufferSize == 0 {
-		receiveBufferSize = defaultReceiveBufferSize
-	}
-
-	server.clientChannelMap = make(map[net.Conn]*clientChannel)
-	server.receiveBufferSize = receiveBufferSize
+	server.conf = conf
+	server.clientInstanceMap = make(map[net.Conn]*clientInstance)
 	server.callbacks = callbacks
 	server.listener = listener
 
@@ -98,14 +110,18 @@ func DestroyTCPServer(server *TCPServer) {
 	server = nil
 }
 
+type clientInstance struct {
+	writeChannel chan []byte
+	stopChannel  chan interface{}
+}
+
 // WriteData 向客户端写数据
 func (server *TCPServer) WriteData(conn net.Conn, data []byte) {
 	if conn == nil || data == nil || len(data) == 0 {
 		return
 	}
 
-	cc := server.getClientChannel(conn)
-	cc.writeChannel <- data
+	server.writeClientChannel(conn, data)
 }
 
 func (server *TCPServer) run() {
@@ -120,49 +136,55 @@ func (server *TCPServer) run() {
 }
 
 func (server *TCPServer) handleConn(conn net.Conn) {
-	if server.callbacks != nil {
-		server.callbacks.OnConnect(server, conn)
-	}
-
-	cc := &clientChannel{
-		writeChannel: make(chan []byte),
+	ci := &clientInstance{
+		writeChannel: make(chan []byte, writeChannelBuffer),
 		stopChannel:  make(chan interface{}),
 	}
 
-	server.addClientChannel(conn, cc)
+	server.addClientChannel(conn, ci)
 
-	go server.readConn(conn)
-	go server.writeConn(conn, cc.writeChannel)
+	go server.readConn(conn, server.conf.ReceiveRetryCount, server.conf.ReceiveRetryPeriodSec)
+	go server.writeConn(conn, ci.writeChannel, server.conf.WriteRetryCount, server.conf.WriteRetryPeriodSec)
+
+	if server.callbacks != nil {
+		go server.callbacks.OnConnect(server, conn)
+	}
 
 	for {
 		select {
-		case <-cc.stopChannel:
+		case <-ci.stopChannel:
 			break
 		}
 	}
 }
 
-func (server *TCPServer) readConn(conn net.Conn) {
+func (server *TCPServer) readConn(conn net.Conn, retryCount uint, retryPeriodSec uint) {
 	defer server.deleteClientChannel(conn)
 
 	for {
-		data := make([]byte, server.receiveBufferSize)
+		data := make([]byte, server.conf.ReceiveBufferSize)
 		n, err := conn.Read(data)
 		if err != nil {
 			if server.callbacks != nil {
 				server.callbacks.OnReceiveError(server, conn, err)
 			}
 
+			if retryCount != 0 {
+				retryCount--
+				time.Sleep(time.Second * time.Duration(retryPeriodSec))
+				continue
+			}
+
 			break
 		}
 
 		if server.callbacks != nil {
-			server.callbacks.OnReceive(server, conn, data, n)
+			go server.callbacks.OnReceive(server, conn, data, n)
 		}
 	}
 }
 
-func (server *TCPServer) writeConn(conn net.Conn, writeChan <-chan []byte) {
+func (server *TCPServer) writeConn(conn net.Conn, writeChan <-chan []byte, retryCount uint, retryPeriodSec uint) {
 	defer server.deleteClientChannel(conn)
 
 	for {
@@ -173,51 +195,76 @@ func (server *TCPServer) writeConn(conn net.Conn, writeChan <-chan []byte) {
 				server.callbacks.OnWriteError(server, conn, err)
 			}
 
+			if retryCount != 0 {
+				retryCount--
+				time.Sleep(time.Second * time.Duration(retryPeriodSec))
+				continue
+			}
+
 			break
 		}
 
 		if server.callbacks != nil {
-			server.callbacks.OnWrite(server, conn, n)
+			go server.callbacks.OnWrite(server, conn, n)
 		}
 	}
 }
 
-func (server *TCPServer) getClientChannel(conn net.Conn) *clientChannel {
-	server.clientChannelMapMutex.RLock()
-	defer server.clientChannelMapMutex.RUnlock()
+func (server *TCPServer) writeClientChannel(conn net.Conn, data []byte) {
+	server.clientInstanceMapMutex.RLock()
+	defer server.clientInstanceMapMutex.RUnlock()
 
-	return server.clientChannelMap[conn]
+	ci, ok := server.clientInstanceMap[conn]
+	if !ok {
+		return
+	}
+
+	ci.writeChannel <- data
 }
 
-func (server *TCPServer) addClientChannel(conn net.Conn, cc *clientChannel) {
-	server.clientChannelMapMutex.Lock()
-	defer server.clientChannelMapMutex.Unlock()
+func (server *TCPServer) addClientChannel(conn net.Conn, ci *clientInstance) {
+	server.clientInstanceMapMutex.Lock()
+	defer server.clientInstanceMapMutex.Unlock()
 
-	server.clientChannelMap[conn] = cc
+	server.clientInstanceMap[conn] = ci
 }
 
 func (server *TCPServer) deleteClientChannel(conn net.Conn) {
-	server.clientChannelMapMutex.Lock()
+	server.clientInstanceMapMutex.Lock()
 
-	cc := server.clientChannelMap[conn]
-	delete(server.clientChannelMap, conn)
+	ci, ok := server.clientInstanceMap[conn]
+	if !ok {
+		server.clientInstanceMapMutex.Unlock()
+		return
+	}
 
-	server.clientChannelMapMutex.Unlock()
+	delete(server.clientInstanceMap, conn)
 
-	close(cc.stopChannel)
-	close(cc.writeChannel)
+	server.clientInstanceMapMutex.Unlock()
+
+	close(ci.stopChannel)
+	ci.stopChannel = nil
+
+	close(ci.writeChannel)
+	ci.writeChannel = nil
+
 	_ = conn.Close()
 }
 
 func (server *TCPServer) deleteAllClientChannel() {
-	server.clientChannelMapMutex.Lock()
-	defer server.clientChannelMapMutex.Unlock()
+	server.clientInstanceMapMutex.Lock()
+	defer server.clientInstanceMapMutex.Unlock()
 
-	for conn, cc := range server.clientChannelMap {
-		close(cc.stopChannel)
-		close(cc.writeChannel)
+	for conn, ci := range server.clientInstanceMap {
+		close(ci.stopChannel)
+		ci.stopChannel = nil
+
+		close(ci.writeChannel)
+		ci.writeChannel = nil
+
 		_ = conn.Close()
+		conn = nil
 	}
 
-	server.clientChannelMap = nil
+	server.clientInstanceMap = nil
 }
