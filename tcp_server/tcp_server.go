@@ -1,10 +1,16 @@
 package tcp_server
 
 import (
+	"github.com/yjp19871013/event-bus/eventbus"
 	"net"
 	"sync"
 	"tcp-server/utils"
 	"time"
+)
+
+const (
+	startBlockEventCount  = 10
+	dealEventRoutingCount = 10
 )
 
 const (
@@ -13,39 +19,6 @@ const (
 	defaultReceiveRetryPeriodSec = 10
 	writeChannelBuffer           = 1 * 1024
 )
-
-// TCPServerCallbacks TCPServer回调
-type TCPServerCallbacks interface {
-	// OnConnect 客户端连接建立时回调
-	// server TCPServer实例
-	// conn 客户端连接，不需要客户代码关闭
-	OnConnect(server *TCPServer, conn net.Conn)
-
-	// OnReceive 收到数据时回调
-	// server TCPServer实例
-	// conn 客户端连接，不需要客户代码关闭
-	// data 读取到的数据
-	// readSize 读取到的数据大小，单位字节
-	OnReceive(server *TCPServer, conn net.Conn, data []byte, readSize int)
-
-	// OnWrite 写入数据成功回调
-	// server TCPServer实例
-	// conn 客户端连接，不需要客户代码关闭
-	// writeSize 写入的数据大小，单位字节
-	OnWrite(server *TCPServer, conn net.Conn, writeSize int)
-
-	// OnReceiveError 收数据错误回调
-	// server TCPServer实例
-	// conn 客户端连接，不需要客户代码关闭
-	// err 错误
-	OnReceiveError(server *TCPServer, conn net.Conn, err error)
-
-	// OnWriteError 写入数据错误回调
-	// server TCPServer实例
-	// conn 客户端连接，不需要客户代码关闭
-	// err 错误
-	OnWriteError(server *TCPServer, conn net.Conn, err error)
-}
 
 type tcpServerConfig struct {
 	ReceiveBufferSize     uint
@@ -73,12 +46,10 @@ type TCPServer struct {
 
 	clientInstanceMap      map[net.Conn]*clientInstance
 	clientInstanceMapMutex sync.RWMutex
-
-	callbacks TCPServerCallbacks
 }
 
 // NewTCPServer 创建并启动TCPServer
-func NewTCPServer(conf *tcpServerConfig, address string, callbacks TCPServerCallbacks) (*TCPServer, error) {
+func NewTCPServer(conf *tcpServerConfig, address string) (*TCPServer, error) {
 	if conf == nil || utils.IsStringEmpty(address) {
 		return nil, ErrParam
 	}
@@ -88,10 +59,11 @@ func NewTCPServer(conf *tcpServerConfig, address string, callbacks TCPServerCall
 		return nil, err
 	}
 
+	eventbus.InitEventBus(startBlockEventCount, dealEventRoutingCount)
+
 	server := new(TCPServer)
 	server.conf = conf
 	server.clientInstanceMap = make(map[net.Conn]*clientInstance)
-	server.callbacks = callbacks
 	server.listener = listener
 
 	go server.run()
@@ -108,6 +80,8 @@ func DestroyTCPServer(server *TCPServer) {
 	_ = server.listener.Close()
 	server.deleteAllClientChannel()
 	server = nil
+
+	eventbus.DestroyEventBus()
 }
 
 type clientInstance struct {
@@ -146,9 +120,10 @@ func (server *TCPServer) handleConn(conn net.Conn) {
 	go server.readConn(conn, server.conf.ReceiveRetryCount, server.conf.ReceiveRetryPeriodSec)
 	go server.writeConn(conn, ci.writeChannel, server.conf.WriteRetryCount, server.conf.WriteRetryPeriodSec)
 
-	if server.callbacks != nil {
-		server.callbacks.OnConnect(server, conn)
-	}
+	eventbus.GetBus().Publish(&OnConnectEvent{
+		Server: server,
+		Conn:   conn,
+	})
 
 	for {
 		select {
@@ -165,9 +140,11 @@ func (server *TCPServer) readConn(conn net.Conn, retryCount uint, retryPeriodSec
 		data := make([]byte, server.conf.ReceiveBufferSize)
 		n, err := conn.Read(data)
 		if err != nil {
-			if server.callbacks != nil {
-				server.callbacks.OnReceiveError(server, conn, err)
-			}
+			eventbus.GetBus().Publish(&OnReceiveErrorEvent{
+				Server: server,
+				Conn:   conn,
+				Err:    err,
+			})
 
 			if retryCount != 0 {
 				retryCount--
@@ -178,9 +155,12 @@ func (server *TCPServer) readConn(conn net.Conn, retryCount uint, retryPeriodSec
 			break
 		}
 
-		if server.callbacks != nil {
-			server.callbacks.OnReceive(server, conn, data, n)
-		}
+		eventbus.GetBus().Publish(&OnReceiveEvent{
+			Server:   server,
+			Conn:     conn,
+			Data:     data,
+			ReadSize: n,
+		})
 	}
 }
 
@@ -191,9 +171,11 @@ func (server *TCPServer) writeConn(conn net.Conn, writeChan <-chan []byte, retry
 		data := <-writeChan
 		n, err := conn.Write(data)
 		if err != nil {
-			if server.callbacks != nil {
-				server.callbacks.OnWriteError(server, conn, err)
-			}
+			eventbus.GetBus().Publish(&OnWriteErrorEvent{
+				Server: server,
+				Conn:   conn,
+				Err:    err,
+			})
 
 			if retryCount != 0 {
 				retryCount--
@@ -204,9 +186,11 @@ func (server *TCPServer) writeConn(conn net.Conn, writeChan <-chan []byte, retry
 			break
 		}
 
-		if server.callbacks != nil {
-			server.callbacks.OnWrite(server, conn, n)
-		}
+		eventbus.GetBus().Publish(&OnWriteEvent{
+			Server:    server,
+			Conn:      conn,
+			WriteSize: n,
+		})
 	}
 }
 
